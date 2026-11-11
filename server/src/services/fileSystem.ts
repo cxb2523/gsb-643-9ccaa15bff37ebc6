@@ -576,40 +576,162 @@ export class FileSystemService {
     }
   }
 
+  /**
+   * Returns the relative folder portion of a validated relative path.
+   * A root-level file yields "" (the data dir itself), never ".".
+   */
+  private relativeFolderOf(relativePath: string): string {
+    const folder = path.dirname(relativePath);
+    return folder === "." ? "" : folder;
+  }
+
+  /**
+   * Invalidate every cache entry that could describe a page relocation.
+   * Keys are derived from validated relative paths and de-duplicated so a
+   * same-folder operation (or identical source/target entries) never fails
+   * and never invalidates the same key twice.
+   */
+  private invalidatePageCaches(
+    oldRelative: string,
+    newRelative: string,
+  ): void {
+    const oldFolder = this.relativeFolderOf(oldRelative);
+    const newFolder = this.relativeFolderOf(newRelative);
+    const keys = new Set<string>([
+      `pages:${oldFolder}`,
+      `pages:${newFolder}`,
+      `page:${oldRelative}`,
+      `page:${newRelative}`,
+    ]);
+    for (const key of keys) {
+      // invalidateKey is a Map.delete: a missing key is a no-op and never throws.
+      this.cache.invalidateKey(key);
+    }
+  }
+
+  /**
+   * Validates and prepares a page relocation (rename or move) BEFORE any file
+   * system mutation takes place. All path validation, source existence/type
+   * checks and destination conflict detection happen here, so any failure
+   * leaves the file system and caches untouched.
+   *
+   * @returns A plan of validated absolute/relative paths, or null when source
+   *          and target resolve to the same file (a successful no-op).
+   */
+  private async planPageRelocation(
+    oldFullPath: string,
+    newFullPath: string,
+  ): Promise<{
+    oldFullPath: string;
+    newFullPath: string;
+    oldRelative: string;
+    newRelative: string;
+  } | null> {
+    const resolvedDataDir = path.resolve(this.dataDir);
+
+    // Re-derive relative paths from the VALIDATED absolute paths.
+    const oldRelative = path.relative(resolvedDataDir, oldFullPath);
+    const newRelative = path.relative(resolvedDataDir, newFullPath);
+
+    // Same resolved path means nothing would change: treat as a successful
+    // no-op. No file system writes and no cache side effects.
+    if (oldFullPath === newFullPath) {
+      return null;
+    }
+
+    // Both paths come from validatePath, but keep an explicit containment
+    // guard on the destination before touching anything.
+    if (
+      !newFullPath.startsWith(resolvedDataDir + path.sep) ||
+      !oldFullPath.startsWith(resolvedDataDir + path.sep)
+    ) {
+      throw new Error("Invalid path: path traversal detected");
+    }
+
+    // Verify the source exists and is a file (no mutation has happened yet).
+    let sourceStat;
+    try {
+      sourceStat = await fs.stat(oldFullPath);
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+        throw new Error(`Source page does not exist: ${oldRelative}`, {
+          cause: error,
+        });
+      }
+      throw error;
+    }
+    if (!sourceStat.isFile()) {
+      throw new Error(`Source path is not a file: ${oldRelative}`);
+    }
+
+    // Destination conflict: refuse (never overwrite) when a different file
+    // already occupies the target path.
+    try {
+      await fs.access(newFullPath);
+      throw new Error(
+        `A file already exists at the destination: ${newRelative}`,
+      );
+    } catch (error: unknown) {
+      const errno = (error as NodeJS.ErrnoException).code;
+      if (errno !== "ENOENT") {
+        // Either our explicit conflict Error above, or an unexpected FS error.
+        throw error;
+      }
+      // ENOENT: the destination is free — safe to proceed.
+    }
+
+    return { oldFullPath, newFullPath, oldRelative, newRelative };
+  }
+
   async renamePage(oldPath: string, newPath: string): Promise<void> {
+    // Validate both user-supplied paths up front — validatePath throws on any
+    // traversal attempt before any file system operation runs.
     const oldFullPath = this.validatePath(oldPath);
     const newFullPath = this.validatePath(newPath);
 
-    // Ensure the new directory exists
-    const newDir = path.dirname(newFullPath);
+    const plan = await this.planPageRelocation(oldFullPath, newFullPath);
+
+    // Source and target are the same file: no-op success, no FS writes.
+    if (plan === null) {
+      return;
+    }
+
+    // All checks passed. Only now may the file system be modified.
+    const newDir = path.dirname(plan.newFullPath);
     await fs.mkdir(newDir, { recursive: true });
 
-    await fs.rename(oldFullPath, newFullPath);
+    // Final guard immediately before the rename (TOCTOU hardening).
+    try {
+      await fs.access(plan.newFullPath);
+      throw new Error(
+        `A file already exists at the destination: ${plan.newRelative}`,
+      );
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") {
+        throw error;
+      }
+    }
 
-    // Invalidate caches - use validated relative paths
-    const oldRelative = path.relative(this.dataDir, oldFullPath);
-    const newRelative = path.relative(this.dataDir, newFullPath);
-    const oldFolderPath = path.dirname(oldRelative);
-    const newFolderPath = path.dirname(newRelative);
-    this.cache.invalidate(`pages:${oldFolderPath}`);
-    this.cache.invalidate(`pages:${newFolderPath}`);
-    this.cache.invalidateKey(`page:${oldRelative}`);
-    this.cache.invalidateKey(`page:${newRelative}`);
+    await fs.rename(plan.oldFullPath, plan.newFullPath);
+
+    // Invalidate caches only after the change succeeded, using the validated
+    // relative paths. De-duplicated keys make same-folder renames safe.
+    this.invalidatePageCaches(plan.oldRelative, plan.newRelative);
 
     // Commit the rename (non-blocking in production, blocking in tests)
     if (this.gitService) {
       if (process.env.TEST_DATA_DIR) {
         // In test mode, wait for commit and let errors propagate
         await this.gitService.commitFiles(
-          [oldRelative, newRelative],
-          `Renamed page: ${oldRelative} → ${newRelative}`,
+          [plan.oldRelative, plan.newRelative],
+          `Renamed page: ${plan.oldRelative} → ${plan.newRelative}`,
         );
       } else {
         // In production, fire and forget
         this.gitService
           .commitFiles(
-            [oldRelative, newRelative],
-            `Renamed page: ${oldRelative} → ${newRelative}`,
+            [plan.oldRelative, plan.newRelative],
+            `Renamed page: ${plan.oldRelative} → ${plan.newRelative}`,
           )
           .catch((err) => console.error("Git commit failed:", err));
       }
@@ -617,65 +739,74 @@ export class FileSystemService {
   }
 
   async movePage(oldPath: string, newFolderPath: string): Promise<string> {
-    // Validate paths first to prevent path traversal
+    // Validate the source path first to prevent path traversal.
     const oldFullPath = this.validatePath(oldPath);
-    const fileName = path.basename(oldFullPath); // Use validated path
-    const newPath = newFolderPath
-      ? path.join(newFolderPath, fileName)
-      : fileName;
-    const newFullPath = this.validatePath(newPath);
 
-    // Check if source file exists
-    await fs.access(oldFullPath);
+    // Validate the destination folder separately so a traversal attempt there
+    // is rejected before any file system operation.
+    const resolvedDataDir = path.resolve(this.dataDir);
+    const destParentFullPath = newFolderPath
+      ? this.validatePath(newFolderPath)
+      : resolvedDataDir;
 
-    // Ensure the destination directory exists
-    const newDir = path.dirname(newFullPath);
+    // Derive the file name from the VALIDATED absolute source path and build
+    // the destination entirely from validated components.
+    const fileName = path.basename(oldFullPath);
+    const newFullPath = path.join(destParentFullPath, fileName);
+
+    // validatePath also normalizes/confirms the joined destination stays in
+    // the data directory (defence in depth).
+    this.validatePath(path.relative(resolvedDataDir, newFullPath));
+
+    const plan = await this.planPageRelocation(oldFullPath, newFullPath);
+
+    // Source and target resolve to the same path (e.g. moving within the same
+    // folder): no-op success, no FS writes.
+    if (plan === null) {
+      return path.relative(resolvedDataDir, oldFullPath);
+    }
+
+    // All checks passed. Ensure the destination directory exists and re-check
+    // the conflict immediately before the rename.
+    const newDir = path.dirname(plan.newFullPath);
     await fs.mkdir(newDir, { recursive: true });
 
-    // Check if destination file already exists
     try {
-      await fs.access(newFullPath);
+      await fs.access(plan.newFullPath);
       throw new Error(
-        "A file with this name already exists in the destination folder",
+        `A file already exists at the destination: ${plan.newRelative}`,
       );
     } catch (error: unknown) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") {
         throw error;
       }
     }
 
-    await fs.rename(oldFullPath, newFullPath);
+    await fs.rename(plan.oldFullPath, plan.newFullPath);
 
-    // Invalidate caches - use validated paths relative to dataDir
-    const oldRelative = path.relative(this.dataDir, oldFullPath);
-    const newRelative = path.relative(this.dataDir, newFullPath);
-    const oldFolderPath = path.dirname(oldRelative);
-    const newFolderRelative = path.relative(this.dataDir, newDir);
-
-    this.cache.invalidate(`pages:${oldFolderPath}`);
-    this.cache.invalidate(`pages:${newFolderRelative}`);
-    this.cache.invalidateKey(`page:${oldRelative}`);
-    this.cache.invalidateKey(`page:${newRelative}`);
+    // Invalidate caches only after the change succeeded, using validated
+    // relative paths. De-duplicated keys make same-folder moves safe.
+    this.invalidatePageCaches(plan.oldRelative, plan.newRelative);
 
     // Commit the move (non-blocking in production, blocking in tests)
     if (this.gitService) {
       if (process.env.TEST_DATA_DIR) {
         // In test mode, wait for commit and let errors propagate
         await this.gitService.commitFiles(
-          [oldRelative, newRelative],
-          `Moved page: ${oldRelative} → ${newRelative}`,
+          [plan.oldRelative, plan.newRelative],
+          `Moved page: ${plan.oldRelative} → ${plan.newRelative}`,
         );
       } else {
         // In production, fire and forget
         this.gitService
           .commitFiles(
-            [oldRelative, newRelative],
-            `Moved page: ${oldRelative} → ${newRelative}`,
+            [plan.oldRelative, plan.newRelative],
+            `Moved page: ${plan.oldRelative} → ${plan.newRelative}`,
           )
           .catch((err) => console.error("Git commit failed:", err));
       }
     }
 
-    return newRelative;
+    return plan.newRelative;
   }
 }
