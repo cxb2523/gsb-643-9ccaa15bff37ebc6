@@ -1,0 +1,14 @@
+node_modules/
+dist/
+build/
+.DS_Store
+*.log
+.env
+.env.local
+test-data/
+**/.attachments/
+
+# Data folder - only track Codex Documentation
+data/*
+!data/Codex Documentation/
+!data/templates/

@@ -1,0 +1,38 @@
+{
+  "name": "codex-server",
+  "version": "1.0.0",
+  "description": "Backend API for Codex",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "dev:mcp": "MCP_ENABLED=true tsx watch src/index.ts",
+    "mcp": "node --loader ts-node/esm src/mcp/standalone.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "start:mcp": "MCP_ENABLED=true node dist/index.js",
+    "test": "jest",
+    "test:watch": "jest --watch"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.5.0",
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "cors": "^2.8.6",
+    "express": "^5.3.0",
+    "multer": "^2.5.0",
+    "ollama": "^0.6.4",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.6",
+    "@types/jest": "^30.0.0",
+    "@types/multer": "^2.3.0",
+    "@types/node": "^26.6.6",
+    "@types/supertest": "^7.2.1",
+    "jest": "^30.5.2",
+    "supertest": "^7.3.1",
+    "ts-jest": "^29.4.15",
+    "tsx": "^4.23.15",
+    "typescript": "^6.0.3"
+  }
+}

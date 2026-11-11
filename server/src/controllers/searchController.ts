@@ -1,0 +1,106 @@
+import { Request, Response } from "express";
+import { fileSystemService } from "../index";
+
+// Escape special regex characters to prevent ReDoS attacks
+const escapeRegExp = (str: string): string => {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+};
+
+export const searchPages = async (req: Request, res: Response) => {
+  try {
+    const query = req.query.q as string;
+
+    if (!query || query.trim().length === 0) {
+      return res.json([]);
+    }
+
+    const searchTerm = query.toLowerCase().trim();
+
+    // Escape regex special characters to prevent ReDoS
+    const escapedSearchTerm = escapeRegExp(searchTerm);
+
+    const results: Array<{
+      path: string;
+      title: string;
+      snippet: string;
+      matches: number;
+    }> = [];
+
+    // Get all folders recursively
+    const getAllFolders = async (
+      node: unknown,
+      folders: string[] = [],
+    ): Promise<string[]> => {
+      if (node && typeof node === "object" && "path" in node) {
+        folders.push((node as { path?: string }).path || "");
+      }
+      if (node && typeof node === "object" && "children" in node) {
+        const children = (node as { children?: unknown[] }).children;
+        if (Array.isArray(children)) {
+          for (const child of children) {
+            await getAllFolders(child, folders);
+          }
+        }
+      }
+      return folders;
+    };
+
+    const folderTree = await fileSystemService.getFolderTree();
+    const allFolders = await getAllFolders(folderTree);
+
+    // Search all pages in all folders
+    for (const folderPath of allFolders) {
+      const pages = await fileSystemService.getPages(folderPath);
+
+      for (const page of pages) {
+        try {
+          const content = await fileSystemService.getPageContent(page.path);
+          const lowerContent = content.toLowerCase();
+
+          // Count matches using simple string splitting (avoids regex complexity)
+          const parts = lowerContent.split(searchTerm);
+          const matches = parts.length - 1;
+
+          if (matches > 0) {
+            // Find snippet with context
+            const index = lowerContent.indexOf(searchTerm);
+            const start = Math.max(0, index - 50);
+            const end = Math.min(
+              content.length,
+              index + searchTerm.length + 50,
+            );
+            let snippet = content.substring(start, end);
+
+            // Add ellipsis
+            if (start > 0) snippet = "..." + snippet;
+            if (end < content.length) snippet = snippet + "...";
+
+            // Highlight the match with HTML <strong> tags
+            // nosemgrep: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp
+            // Safe: escapedSearchTerm has been sanitized with escapeRegExp to prevent ReDoS
+            const regex = new RegExp(`(${escapedSearchTerm})`, "gi");
+            snippet = snippet.replace(regex, "<strong>$1</strong>");
+
+            results.push({
+              path: page.path,
+              title: page.name.replace(".md", ""),
+              snippet,
+              matches,
+            });
+          }
+        } catch (error) {
+          // Use structured logging to avoid format string issues
+          console.error("Error searching page:", { path: page.path, error });
+        }
+      }
+    }
+
+    // Sort by number of matches (most relevant first)
+    results.sort((a, b) => b.matches - a.matches);
+
+    res.json(results);
+  } catch (error) {
+    console.error("Search error:", error);
+    res.status(500).json({ error: "Search failed" });
+  }
+};
